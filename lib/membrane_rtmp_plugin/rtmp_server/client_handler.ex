@@ -145,6 +145,14 @@ defmodule Membrane.RTMPServer.ClientHandler do
   end
 
   @impl true
+  def handle_info({:disconnect, app, stream_key}, state) do
+    Logger.warning("Disconnect requested for /#{app}/#{stream_key}, terminating connection.")
+    :gen_tcp.close(state.socket)
+
+    {:noreply, %{state | published?: false}}
+  end
+
+  @impl true
   def handle_info(other_msg, state) do
     handler_state = state.handler.handle_info(other_msg, state.handler_state)
 
