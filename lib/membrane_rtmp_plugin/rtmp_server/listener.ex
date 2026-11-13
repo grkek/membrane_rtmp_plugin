@@ -4,15 +4,46 @@ defmodule Membrane.RTMPServer.Listener do
   # Module responsible for maintaining the listening socket.
 
   use Task
+  use Bunch
   require Logger
   alias Membrane.RTMPServer.ClientHandler
+
+  @listen_opts [
+    :binary,
+    packet: :raw,
+    active: false,
+    reuseaddr: true
+  ]
+
+  @ssl_handshake_opts [
+    :certfile,
+    :keyfile,
+    :cacertfile,
+    :password,
+    :versions
+  ]
+
+  @ssl_listen_opts [
+    :verify,
+    :fail_if_no_peer_cert,
+    :versions,
+    :ciphers,
+    :honor_cipher_order,
+    :secure_renegotiate,
+    :reuse_sessions,
+    :cacertfile,
+    :depth,
+    :log_level
+  ]
 
   @spec run(
           options :: %{
             use_ssl?: boolean(),
             socket_module: :gen_tcp | :ssl,
             server: pid(),
-            port: non_neg_integer()
+            client_supervisor: pid(),
+            port: non_neg_integer(),
+            ssl_options: keyword()
           }
         ) :: no_return()
   def run(options) do
@@ -20,53 +51,106 @@ defmodule Membrane.RTMPServer.Listener do
 
     listen_options =
       if options.use_ssl? do
-        certfile = System.get_env("CERT_PATH")
-        keyfile = System.get_env("CERT_KEY_PATH")
+        ssl_opts =
+          options
+          |> Map.get(:ssl_options, [])
+          |> Keyword.take(@ssl_listen_opts)
 
-        [
-          :binary,
-          packet: :raw,
-          active: false,
-          certfile: certfile,
-          keyfile: keyfile
-        ]
+        Logger.debug("SSL options for listen: #{inspect(ssl_opts)}")
+
+        combined = @listen_opts ++ ssl_opts
+        Logger.debug("Combined listen options: #{inspect(combined)}")
+        combined
       else
-        [
-          :binary,
-          packet: :raw,
-          active: false
-        ]
+        @listen_opts
       end
 
     {:ok, socket} = options.socket_module.listen(options.port, listen_options)
-    send(options.server, {:port, :inet.port(socket)})
+
+    port =
+      case options.socket_module do
+        :gen_tcp ->
+          {:ok, {_ip, port}} = :inet.sockname(socket)
+          port
+
+        :ssl ->
+          {:ok, {_ip, port}} = :ssl.sockname(socket)
+          port
+      end
+
+    send(options.server, {:port, port})
 
     accept_loop(socket, options)
   end
 
   defp accept_loop(socket, options) do
-    {:ok, client} = :gen_tcp.accept(socket)
+    client =
+      case options.socket_module do
+        :gen_tcp ->
+          {:ok, client} = :gen_tcp.accept(socket)
+          client
 
-    {:ok, client_reference} =
-      GenServer.start_link(ClientHandler,
-        socket: client,
-        use_ssl?: options.use_ssl?,
-        handler: options.handler,
-        server: options.server,
-        handle_new_client: options.handle_new_client,
-        client_timeout: options.client_timeout
-      )
+        :ssl ->
+          {:ok, client} = :ssl.transport_accept(socket)
+          Logger.debug("SSL transport accept successful, starting handshake...")
 
-    case :gen_tcp.controlling_process(client, client_reference) do
-      :ok ->
-        send(client_reference, :control_granted)
+          ssl_handshake_opts =
+            options
+            |> Map.get(:ssl_options, [])
+            |> Keyword.take(@ssl_handshake_opts)
 
-      {:error, reason} ->
+          ssl_handshake_opts =
+            ssl_handshake_opts
+            |> Keyword.put(:verify, :verify_none)
+            |> Keyword.put(:fail_if_no_peer_cert, false)
+
+          Logger.debug("SSL handshake options: #{inspect(ssl_handshake_opts)}")
+
+          case :ssl.handshake(client, ssl_handshake_opts, 10_000) do
+            {:ok, ssl_socket} ->
+              Logger.info("SSL handshake successful")
+              ssl_socket
+
+            {:error, reason} ->
+              Logger.error("SSL handshake failed: #{inspect(reason)}")
+              :ssl.close(client)
+              accept_loop(socket, options)
+          end
+      end
+
+    start_client_handler(client, options)
+    accept_loop(socket, options)
+  end
+
+  defp start_client_handler(client, options) do
+    client_handler_opts = [
+      socket: client,
+      use_ssl?: options.use_ssl?,
+      server: options.server,
+      handle_new_client: options.handle_new_client,
+      client_timeout: options.client_timeout
+    ]
+
+    withl start:
+            {:ok, client_reference} <-
+              DynamicSupervisor.start_child(
+                options.client_supervisor,
+                {ClientHandler, client_handler_opts}
+              ),
+          control: :ok <- options.socket_module.controlling_process(client, client_reference) do
+      send(client_reference, :control_granted)
+    else
+      start: {:error, reason} ->
+        Logger.error("Couldn't start client handler due to: #{inspect(reason)}")
+        options.socket_module.close(client)
+
+      control: {:error, reason} ->
         Logger.error(
           "Couldn't pass control to process: #{inspect(client_reference)} due to: #{inspect(reason)}"
         )
-    end
 
-    accept_loop(socket, options)
+        DynamicSupervisor.terminate_child(options.client_supervisor, client_reference)
+        options.socket_module.close(client)
+    end
   end
 end

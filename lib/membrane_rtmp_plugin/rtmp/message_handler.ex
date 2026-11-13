@@ -28,7 +28,7 @@ defmodule Membrane.RTMP.MessageHandler do
           {:set_chunk_size_required, non_neg_integer()}
           | {:connected, Membrane.RTMP.Messages.Connect.t()}
           | {:published, Membrane.RTMP.Messages.Publish.t()}
-          | :end_of_stream
+          | :delete_stream
           | {:data_available, binary()}
   @type t() :: %{
           socket: :gen_tcp.socket() | :ssl.socket(),
@@ -171,8 +171,8 @@ defmodule Membrane.RTMP.MessageHandler do
 
   # According to ffmpeg's documentation, this command should prepare the server to receive media streams
   # We are simply acknowledging the message
-  defp do_handle_client_message(%Messages.FCPublish{}, _header, state) do
-    %Messages.Anonymous{name: "onFCPublish", properties: []}
+  defp do_handle_client_message(%Messages.FCPublish{} = fc_publish, _header, state) do
+    %Messages.Anonymous{name: "onFCPublish", tx_id: fc_publish.tx_id, properties: []}
     |> send_rtmp_payload(state.socket, chunk_stream_id: 3)
 
     {:cont, state}
@@ -218,7 +218,7 @@ defmodule Membrane.RTMP.MessageHandler do
   end
 
   defp do_handle_client_message(%Messages.DeleteStream{}, _header, state) do
-    {:halt, %{state | events: [:end_of_stream | state.events]}}
+    {:halt, %{state | events: [:delete_stream | state.events]}}
   end
 
   # Check bandwidth message
@@ -254,7 +254,11 @@ defmodule Membrane.RTMP.MessageHandler do
     }
   end
 
-  defp get_additional_media_events(rtmp_header, additional_media, %{header_sent?: true} = state) do
+  defp get_additional_media_events(
+         %Membrane.RTMP.Header{} = rtmp_header,
+         additional_media,
+         %{header_sent?: true} = state
+       ) do
     # NOTE: we are replacing the type_id from 18 to 8 (script data to audio data) as it carries the
     # additional audio track
     data = additional_media.media
@@ -275,7 +279,7 @@ defmodule Membrane.RTMP.MessageHandler do
     Map.update!(state, :events, &[event | &1])
   end
 
-  defp get_additional_media_events(rtmp_header, additional_media, state) do
+  defp get_additional_media_events(%Membrane.RTMP.Header{} = rtmp_header, additional_media, state) do
     data = additional_media.media
 
     header = %Membrane.RTMP.Header{rtmp_header | type_id: 8, body_size: byte_size(data)}
@@ -336,6 +340,11 @@ defmodule Membrane.RTMP.MessageHandler do
   end
 
   @compile {:inline, socket_module: 1}
-  defp socket_module({:sslsocket, _1, _2}), do: :ssl
-  defp socket_module(_other), do: :gen_tcp
+  defp socket_module(socket) when is_tuple(socket) and elem(socket, 0) == :sslsocket do
+    :ssl
+  end
+
+  defp socket_module(_socket) do
+    :gen_tcp
+  end
 end

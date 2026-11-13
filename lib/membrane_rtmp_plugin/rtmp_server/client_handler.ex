@@ -7,56 +7,70 @@ defmodule Membrane.RTMPServer.ClientHandler do
   # It also containts functions responsible for maintaining the lifecycle of the
   # client connection.
 
-  use GenServer
+  use GenServer, restart: :temporary
 
   require Logger
-  alias Membrane.RTMP.{Handshake, MessageHandler, MessageParser}
+  alias Membrane.RTMP.{Handshake, MessageHandler, MessageParser, Messages}
+
+  @typedoc """
+  A type representing a module which implements `#{inspect(__MODULE__)}` behaviour.
+  """
+  @type t :: module()
 
   @typedoc """
   Type representing the user defined state of the client handler.
   """
-  @type t :: term()
+  @type state :: any()
 
   @doc """
   The callback invoked once the client handler is created.
   It should return the initial state of the client handler.
   """
-  @callback handle_init(any()) :: t()
-
-  @doc """
-  The callback invoked when the client sends the `Membrane.RTMP.Messages.Connect.t()`
-  message.
-  """
-  @callback handle_connected(connected_msg :: Membrane.RTMP.Messages.Connect.t(), state :: t()) ::
-              t()
-
-  @doc """
-  The callback invoked when the client sends the `Membrane.RTMP.Messages.Publish.t()`
-  message.
-  """
-  @callback handle_stream_published(
-              publish_msg :: Membrane.RTMP.Messages.Publish.t(),
-              state :: t()
-            ) :: t()
+  @callback handle_init(any()) :: state()
 
   @doc """
   The callback invoked when new piece of data is received from a given client.
   """
-  @callback handle_data_available(payload :: binary(), state :: t()) :: t()
+  @callback handle_data_available(payload :: binary(), state :: state()) :: state()
 
   @doc """
-  The callback invoked when the client served by given client handler
-  stops sending data.
-  (for instance, when the remote client deletes the stream or
-  terminates the socket connection)
+  Callback invoked when the RMTP stream is finished.
   """
-  @callback handle_end_of_stream(state :: t()) :: t()
+  @callback handle_delete_stream(state :: state()) :: state()
+
+  @doc """
+  Callback invoked when the socket connection is terminated. In normal
+  conditions, `handle_delete_stream` is called before this one. If delete_stream
+  is not called and connection_closed is, it might just mean that the
+  connection was lost (for instance when TCP socket is closed unexpectedly).
+
+  It is up to the users to determined how to handle it in their case.
+  """
+  @callback handle_connection_closed(state :: state()) :: state()
+
+  @doc """
+  The optional callback invoked when the client handler receives RTMP message with
+  metadata information (just like a resolution or a framerate of a video stream).
+  The following messages are considered the ones that contain metadata:
+  1) OnMetaData
+  2) SetDataFrame
+  """
+  @callback handle_metadata(
+              {:metadata_message, Messages.OnMetaData.t() | Messages.SetDataFrame.t()},
+              state()
+            ) :: state()
 
   @doc """
   The callback invoked when the client handler receives a message
   that is not recognized as an internal message of the client handler.
   """
-  @callback handle_info(msg :: term(), t()) :: t()
+  @callback handle_info(msg :: term(), state()) :: state()
+
+  @optional_callbacks handle_metadata: 2
+
+  defguardp is_metadata_message(message)
+            when is_struct(message, Messages.OnMetaData) or
+                   is_struct(message, Messages.SetDataFrame)
 
   @doc """
   Makes the client handler ask client for the desired number of buffers
@@ -67,13 +81,15 @@ defmodule Membrane.RTMPServer.ClientHandler do
     :ok
   end
 
+  @doc false
+  @spec start_link(keyword()) :: GenServer.on_start()
+  def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
+
   @impl true
   def init(opts) do
     opts = Map.new(opts)
     message_parser_state = Handshake.init_server() |> MessageParser.init()
     message_handler_state = MessageHandler.init(%{socket: opts.socket, use_ssl?: opts.use_ssl?})
-
-    %handler_module{} = opts.handler
 
     {:ok,
      %{
@@ -81,8 +97,8 @@ defmodule Membrane.RTMPServer.ClientHandler do
        use_ssl?: opts.use_ssl?,
        message_parser_state: message_parser_state,
        message_handler_state: message_handler_state,
-       handler: handler_module,
-       handler_state: handler_module.handle_init(opts.handler),
+       handler: nil,
+       handler_state: nil,
        app: nil,
        stream_key: nil,
        server: opts.server,
@@ -102,7 +118,7 @@ defmodule Membrane.RTMPServer.ClientHandler do
   @impl true
   def handle_info({:tcp_closed, socket}, %{use_ssl?: false} = state)
       when state.socket == socket do
-    events = [:end_of_stream]
+    events = [:connection_closed]
     state = Enum.reduce(events, state, &handle_event/2)
 
     {:noreply, state}
@@ -115,7 +131,7 @@ defmodule Membrane.RTMPServer.ClientHandler do
 
   @impl true
   def handle_info({:ssl_closed, socket}, %{use_ssl?: true} = state) when state.socket == socket do
-    events = [:end_of_stream]
+    events = [:connection_closed]
     state = Enum.reduce(events, state, &handle_event/2)
 
     {:noreply, state}
@@ -160,9 +176,21 @@ defmodule Membrane.RTMPServer.ClientHandler do
   end
 
   defp handle_data(data, state) do
-    {messages, message_parser_state} =
-      MessageParser.parse_packet_messages(data, state.message_parser_state)
+    data
+    |> MessageParser.parse_packet_messages(state.message_parser_state)
+    |> handle_parse_result(state)
+  end
 
+  defp handle_parse_result({:error, reason}, state) do
+    Logger.warning(
+      "Closing RTMP client connection #{inspect(peername(state))} due to: #{inspect(reason)}"
+    )
+
+    close_socket(state)
+    {:stop, :normal, state}
+  end
+
+  defp handle_parse_result({messages, message_parser_state}, state) do
     {message_handler_state, events} =
       MessageHandler.handle_client_messages(messages, state.message_handler_state)
 
@@ -171,20 +199,51 @@ defmodule Membrane.RTMPServer.ClientHandler do
         %{publish_msg: %Membrane.RTMP.Messages.Publish{stream_key: stream_key}} =
           message_handler_state
 
-        if is_function(state.handle_new_client) do
-          state.handle_new_client.(self(), state.app, stream_key)
-        else
+        if not is_function(state.handle_new_client) do
           raise "handle_new_client is not a function"
         end
 
-        Process.send_after(self(), {:client_timeout, state.app, stream_key}, state.client_timeout)
+        {handler_module, opts} =
+          case state.handle_new_client.(self(), state.app, stream_key) do
+            {handler_module, opts} -> {handler_module, opts}
+            handler_module -> {handler_module, %{}}
+          end
 
-        %{state | notified_about_client?: true}
+        Process.send_after(
+          self(),
+          {:client_timeout, state.app, stream_key},
+          Membrane.Time.as_milliseconds(state.client_timeout, :round)
+        )
+
+        %{
+          state
+          | notified_about_client?: true,
+            handler: handler_module,
+            handler_state: handler_module.handle_init(opts)
+        }
       else
         state
       end
 
     state = Enum.reduce(events, state, &handle_event/2)
+
+    state =
+      if state.notified_about_client? &&
+           Kernel.function_exported?(state.handler, :handle_metadata, 2) do
+        new_handler_state =
+          Enum.reduce(messages, state.handler_state, fn
+            {%Membrane.RTMP.Header{}, message}, handler_state
+            when is_metadata_message(message) ->
+              state.handler.handle_metadata({:metadata_message, message}, handler_state)
+
+            _other, handler_state ->
+              handler_state
+          end)
+
+        %{state | handler_state: new_handler_state}
+      else
+        state
+      end
 
     request_data(state)
 
@@ -199,8 +258,18 @@ defmodule Membrane.RTMPServer.ClientHandler do
   defp handle_event(event, state) do
     # call callbacks
     case event do
-      :end_of_stream ->
-        new_handler_state = state.handler.handle_end_of_stream(state.handler_state)
+      :connection_closed ->
+        case state.handler do
+          nil ->
+            state
+
+          handler ->
+            new_handler_state = handler.handle_connection_closed(state.handler_state)
+            %{state | handler_state: new_handler_state}
+        end
+
+      :delete_stream ->
+        new_handler_state = state.handler.handle_delete_stream(state.handler_state)
         %{state | handler_state: new_handler_state}
 
       {:set_chunk_size_required, chunk_size} ->
@@ -218,19 +287,12 @@ defmodule Membrane.RTMPServer.ClientHandler do
         }
 
       {:connected, connected_msg} ->
-        new_handler_state =
-          state.handler.handle_connected(connected_msg, state.handler_state)
-
-        %{state | handler_state: new_handler_state, app: connected_msg.app}
+        %{state | app: connected_msg.app}
 
       {:published, publish_msg} ->
-        new_handler_state =
-          state.handler.handle_stream_published(publish_msg, state.handler_state)
-
         %{
           state
-          | handler_state: new_handler_state,
-            stream_key: publish_msg.stream_key,
+          | stream_key: publish_msg.stream_key,
             published?: true
         }
     end
@@ -245,6 +307,12 @@ defmodule Membrane.RTMPServer.ClientHandler do
       end
     end
   end
+
+  defp close_socket(%{use_ssl?: true, socket: socket}), do: :ssl.close(socket)
+  defp close_socket(%{use_ssl?: false, socket: socket}), do: :gen_tcp.close(socket)
+
+  defp peername(%{use_ssl?: true, socket: socket}), do: :ssl.peername(socket)
+  defp peername(%{use_ssl?: false, socket: socket}), do: :inet.peername(socket)
 
   defp finish_handshake(state) when not state.published? do
     {message_handler_state, events} =

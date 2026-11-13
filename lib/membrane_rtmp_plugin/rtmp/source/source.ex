@@ -36,6 +36,13 @@ defmodule Membrane.RTMP.Source do
                 An URL on which the client is expected to connect, for example:
                 rtmp://127.0.0.1:1935/app/stream_key
                 """
+              ],
+              client_timeout: [
+                default: Membrane.Time.seconds(5),
+                spec: Membrane.Time.t(),
+                description: """
+                Time after which an unused client connection is automatically closed, expressed in `Membrane.Time.t()` units. Defaults to 5 seconds.
+                """
               ]
 
   defguardp is_builtin_server(opts)
@@ -54,7 +61,8 @@ defmodule Membrane.RTMP.Source do
       url: opts.url,
       mode: :builtin_server,
       client_ref: nil,
-      use_ssl?: nil
+      use_ssl?: nil,
+      client_timeout: opts.client_timeout
     }
 
     {[], state}
@@ -86,15 +94,15 @@ defmodule Membrane.RTMP.Source do
 
     handle_new_client = fn client_ref, app, stream_key ->
       send(parent_pid, {:client_ref, client_ref, app, stream_key})
+      __MODULE__.ClientHandlerImpl
     end
 
     {:ok, server_pid} =
       Membrane.RTMPServer.start_link(
-        handler: %__MODULE__.ClientHandlerImpl{controlling_process: self()},
         port: port,
         use_ssl?: use_ssl?,
         handle_new_client: handle_new_client,
-        client_timeout: 100
+        client_timeout: state.client_timeout
       )
 
     state = %{state | app: app, stream_key: stream_key, server: server_pid}
@@ -168,10 +176,25 @@ defmodule Membrane.RTMP.Source do
   def handle_info(
         {:client_ref, client_ref, app, stream_key},
         _ctx,
-        %{mode: :builtin_server} = state
+        %{mode: :builtin_server, client_ref: nil} = state
       )
       when app == state.app and stream_key == state.stream_key do
     {[setup: :complete], %{state | client_ref: client_ref}}
+  end
+
+  @impl true
+  def handle_info(
+        {:client_ref, client_ref, app, stream_key},
+        _ctx,
+        %{mode: :builtin_server} = state
+      )
+      when app == state.app and stream_key == state.stream_key do
+    # Duplicate connection on same app/stream_key - ignore it
+    Logger.warning(
+      "Duplicate client connection detected on /#{app}/#{stream_key}, discarding #{inspect(client_ref)}; already handling #{inspect(state.client_ref)}"
+    )
+
+    {[], state}
   end
 
   @impl true
@@ -180,6 +203,7 @@ defmodule Membrane.RTMP.Source do
         _ctx,
         %{mode: :builtin_server} = state
       ) do
+    # Connection on wrong app/stream_key
     Logger.warning("Unexpected client connected on /#{app}/#{stream_key}")
     {[], state}
   end
@@ -190,12 +214,16 @@ defmodule Membrane.RTMP.Source do
   end
 
   @impl true
-  def handle_info(:end_of_stream, ctx, state) do
+  def handle_info(:connection_closed, ctx, state) do
     if ctx.pads[:output].end_of_stream? do
       {[], state}
     else
       {[end_of_stream: :output], state}
     end
+  end
+
+  def handle_info(:delete_stream, _ctx, state) do
+    {[notify_parent: :stream_deleted], state}
   end
 
   @impl true

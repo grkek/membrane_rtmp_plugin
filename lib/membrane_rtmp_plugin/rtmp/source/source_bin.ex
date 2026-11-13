@@ -13,15 +13,16 @@ defmodule Membrane.RTMP.SourceBin do
   """
   use Membrane.Bin
 
+  require Membrane.Logger
   alias Membrane.{AAC, H264, RTMP}
 
   def_output_pad :video,
     accepted_format: H264,
-    availability: :always
+    availability: :on_request
 
   def_output_pad :audio,
     accepted_format: AAC,
-    availability: :always
+    availability: :on_request
 
   def_options client_ref: [
                 default: nil,
@@ -38,36 +39,67 @@ defmodule Membrane.RTMP.SourceBin do
                 An URL on which the client is expected to connect, for example:
                 rtmp://127.0.0.1:1935/app/stream_key
                 """
+              ],
+              client_timeout: [
+                default: Membrane.Time.seconds(5),
+                spec: Membrane.Time.t(),
+                description: """
+                Time after which an unused client connection is automatically closed, expressed in `Membrane.Time.t()` units. Defaults to 5 seconds.
+                """
               ]
 
   @impl true
   def handle_init(_ctx, %__MODULE__{} = opts) do
-    structure = [
+    spec =
       child(:src, %RTMP.Source{
         client_ref: opts.client_ref,
-        url: opts.url
+        url: opts.url,
+        client_timeout: opts.client_timeout
       })
-      |> child(:demuxer, Membrane.FLV.Demuxer),
-      child(:audio_parser, %Membrane.AAC.Parser{
-        out_encapsulation: :none
-      }),
-      child(:video_parser, Membrane.H264.Parser),
-      #
-      get_child(:demuxer)
-      |> via_out(Pad.ref(:audio, 0))
-      |> get_child(:audio_parser)
-      |> bin_output(:audio),
-      #
-      get_child(:demuxer)
-      |> via_out(Pad.ref(:video, 0))
-      |> get_child(:video_parser)
-      |> bin_output(:video)
-    ]
+      |> child(:demuxer, Membrane.FLV.Demuxer)
 
-    {[spec: structure], %{}}
+    state = %{
+      demuxer_audio_pad_ref: nil,
+      demuxer_video_pad_ref: nil
+    }
+
+    {[spec: spec], state}
   end
 
   @impl true
+  def handle_pad_added(Pad.ref(:audio, _ref) = pad, ctx, state) do
+    assert_pad_count!(:audio, ctx)
+
+    spec =
+      child(:funnel_audio, Membrane.Funnel, get_if_exists: true)
+      |> bin_output(pad)
+
+    {actions, state} = maybe_link_audio_pad(state)
+
+    {[spec: spec] ++ actions, state}
+  end
+
+  def handle_pad_added(Pad.ref(:video, _ref) = pad, ctx, state) do
+    assert_pad_count!(:video, ctx)
+
+    spec =
+      child(:funnel_video, Membrane.Funnel, get_if_exists: true)
+      |> bin_output(pad)
+
+    {actions, state} = maybe_link_video_pad(state)
+
+    {[spec: spec] ++ actions, state}
+  end
+
+  @impl true
+  def handle_child_notification({:new_stream, pad_ref, :AAC}, :demuxer, _ctx, state) do
+    maybe_link_audio_pad(%{state | demuxer_audio_pad_ref: pad_ref})
+  end
+
+  def handle_child_notification({:new_stream, pad_ref, :H264}, :demuxer, _ctx, state) do
+    maybe_link_video_pad(%{state | demuxer_video_pad_ref: pad_ref})
+  end
+
   def handle_child_notification(
         {type, _socket, _pid} = notification,
         :src,
@@ -92,6 +124,18 @@ defmodule Membrane.RTMP.SourceBin do
     {[notify_parent: :unexpected_socket_close], state}
   end
 
+  def handle_child_notification(:stream_deleted, :src, _ctx, state) do
+    {[notify_parent: :stream_deleted], state}
+  end
+
+  def handle_child_notification(notification, child, _ctx, state) do
+    Membrane.Logger.warning(
+      "Received unrecognized child notification from: #{inspect(child)}: #{inspect(notification)}"
+    )
+
+    {[], state}
+  end
+
   @doc """
   Passes the control of the socket to the `source`.
 
@@ -110,5 +154,50 @@ defmodule Membrane.RTMP.SourceBin do
   @spec secure_pass_control(:ssl.sslsocket(), pid()) :: :ok | {:error, any()}
   def secure_pass_control(socket, source) do
     :ssl.controlling_process(socket, source)
+  end
+
+  defp maybe_link_audio_pad(state) when state.demuxer_audio_pad_ref != nil do
+    {[
+       spec:
+         get_child(:demuxer)
+         |> via_out(state.demuxer_audio_pad_ref)
+         |> child(:audio_parser, %Membrane.AAC.Parser{
+           out_encapsulation: :none
+         })
+         |> child(:funnel_audio, Membrane.Funnel, get_if_exists: true)
+     ], state}
+  end
+
+  defp maybe_link_audio_pad(state) do
+    {[], state}
+  end
+
+  defp maybe_link_video_pad(state) when state.demuxer_video_pad_ref != nil do
+    {[
+       spec:
+         get_child(:demuxer)
+         |> via_out(state.demuxer_video_pad_ref)
+         |> child(:video_parser, Membrane.H264.Parser)
+         |> child(:funnel_video, Membrane.Funnel, get_if_exists: true)
+     ], state}
+  end
+
+  defp maybe_link_video_pad(state) do
+    {[], state}
+  end
+
+  defp assert_pad_count!(name, ctx) do
+    count =
+      ctx.pads
+      |> Map.keys()
+      |> Enum.count(fn pad_ref -> Pad.name_by_ref(pad_ref) == name end)
+
+    if count > 1 do
+      raise(
+        "Linking more than one #{inspect(name)} output pad to #{inspect(__MODULE__)} is not allowed"
+      )
+    end
+
+    :ok
   end
 end

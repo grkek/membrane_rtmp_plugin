@@ -1,7 +1,5 @@
-defmodule Membrane.RTMP.Messages.ReleaseStream do
-  @moduledoc """
-  Defines the RTMP `releaseStream` command.
-  """
+defmodule Membrane.RTMP.Messages.FCPublish do
+  @moduledoc false
 
   @behaviour Membrane.RTMP.Message
 
@@ -15,10 +13,10 @@ defmodule Membrane.RTMP.Messages.ReleaseStream do
           tx_id: non_neg_integer()
         }
 
-  @name "releaseStream"
+  @names ["FCPublish", "@FCPublish"]
 
   @impl true
-  def from_data([@name, tx_id, :null, stream_key]) do
+  def from_data([name, tx_id, :null, stream_key]) when name in @names do
     %__MODULE__{tx_id: tx_id, stream_key: stream_key}
   end
 
@@ -27,7 +25,7 @@ defmodule Membrane.RTMP.Messages.ReleaseStream do
 
     @impl true
     def serialize(%@for{tx_id: tx_id, stream_key: stream_key}) do
-      Encoder.encode(["releaseStream", tx_id, :null, stream_key])
+      Encoder.encode(["FCPublish", tx_id, :null, stream_key])
     end
 
     @impl true

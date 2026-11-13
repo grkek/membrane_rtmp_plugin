@@ -5,8 +5,6 @@ const AVRational MEMBRANE_TIME_BASE = (AVRational){1, 1000000000};
 
 void handle_init_state(State *state);
 
-static bool is_ready(State *state);
-
 UNIFEX_TERM create(UnifexEnv *env, char *rtmp_url, int audio_present,
                    int video_present) {
   State *state = unifex_alloc_state(env);
@@ -19,7 +17,7 @@ UNIFEX_TERM create(UnifexEnv *env, char *rtmp_url, int audio_present,
   avformat_alloc_output_context2(&state->output_ctx, NULL, "flv", rtmp_url);
   if (!state->output_ctx) {
     create_result =
-        create_result_error(env, "Failed to initialize output context");
+        create_result_error_alloc_failed(env);
     goto end;
   }
   create_result = create_result_ok(env, state);
@@ -29,6 +27,9 @@ end:
 }
 
 UNIFEX_TERM try_connect(UnifexEnv *env, State *state) {
+  if (!state->output_ctx) {
+    return try_connect_result_error_closed(env);
+  }
   const char *rtmp_url = state->output_ctx->url;
   if (!(state->output_ctx->oformat->flags & AVFMT_NOFILE)) {
     int av_err = avio_open(&state->output_ctx->pb, rtmp_url, AVIO_FLAG_WRITE);
@@ -43,16 +44,27 @@ UNIFEX_TERM try_connect(UnifexEnv *env, State *state) {
   return try_connect_result_ok(env);
 }
 
+static void close_output(State *state) {
+  if (!state->output_ctx) {
+    return;
+  }
+  if (state->output_ctx->pb) {
+    avio_closep(&state->output_ctx->pb);
+  }
+  avformat_free_context(state->output_ctx);
+  state->output_ctx = NULL;
+}
+
 UNIFEX_TERM flush_and_close_stream(UnifexEnv *env, State *state) {
-  if (!state->output_ctx || state->closed || !is_ready(state)) {
+  if (!state->output_ctx || !state->header_written) {
+    close_output(state);
     return finalize_stream_result_ok(env);
   }
-  if (av_write_trailer(state->output_ctx)) {
-    return unifex_raise(env, "Failed writing stream trailer");
+  int trailer_err = av_write_trailer(state->output_ctx);
+  close_output(state);
+  if (trailer_err) {
+    return finalize_stream_result_error_write_trailer_failed(env);
   }
-  avio_close(state->output_ctx->pb);
-  avformat_free_context(state->output_ctx);
-  state->closed = true;
   return finalize_stream_result_ok(env);
 }
 
@@ -62,10 +74,18 @@ UNIFEX_TERM finalize_stream(UnifexEnv *env, State *state) {
 }
 
 UNIFEX_TERM init_video_stream(UnifexEnv *env, State *state, int width,
-                              int height, UnifexPayload *avc_config) {
+                              int height, int64_t bitrate,
+                              UnifexPayload *avc_config) {
   AVStream *video_stream;
+  if (!state->output_ctx) {
+    return init_video_stream_result_error_closed(env);
+  }
   if (state->video_stream_index != -1) {
     return init_video_stream_result_error_stream_format_resent(env);
+  }
+  bool ready = !state->audio_present || state->audio_stream_index != -1;
+  if (ready && !state->header_written && !state->output_ctx->pb) {
+    return init_video_stream_result_error_not_connected(env);
   }
 
   video_stream = avformat_new_stream(state->output_ctx, NULL);
@@ -78,6 +98,7 @@ UNIFEX_TERM init_video_stream(UnifexEnv *env, State *state, int width,
   video_stream->codecpar->codec_id = AV_CODEC_ID_H264;
   video_stream->codecpar->width = width;
   video_stream->codecpar->height = height;
+  video_stream->codecpar->bit_rate = bitrate;
 
   video_stream->codecpar->extradata_size = avc_config->size;
   video_stream->codecpar->extradata =
@@ -88,21 +109,32 @@ UNIFEX_TERM init_video_stream(UnifexEnv *env, State *state, int width,
   }
   memcpy(video_stream->codecpar->extradata, avc_config->data, avc_config->size);
 
-  bool ready = is_ready(state);
   if (ready && !state->header_written) {
-    if (avformat_write_header(state->output_ctx, NULL) < 0) {
+    AVDictionary *options = NULL;
+    av_dict_set(&options, "flvflags", "no_duration_filesize", 0);
+    if (avformat_write_header(state->output_ctx, &options) < 0) {
+      av_dict_free(&options);
       return unifex_raise(env, "Failed writing header");
     }
+    av_dict_free(&options);
     state->header_written = true;
   }
   return init_video_stream_result_ok(env, ready, state);
 }
 
 UNIFEX_TERM init_audio_stream(UnifexEnv *env, State *state, int channels,
-                              int sample_rate, UnifexPayload *aac_config) {
+                              int sample_rate, int64_t bitrate,
+                              UnifexPayload *aac_config) {
   AVStream *audio_stream;
+  if (!state->output_ctx) {
+    return init_audio_stream_result_error_closed(env);
+  }
   if (state->audio_stream_index != -1) {
     return init_audio_stream_result_error_stream_format_resent(env);
+  }
+  bool ready = !state->video_present || state->video_stream_index != -1;
+  if (ready && !state->header_written && !state->output_ctx->pb) {
+    return init_audio_stream_result_error_not_connected(env);
   }
 
   audio_stream = avformat_new_stream(state->output_ctx, NULL);
@@ -120,6 +152,7 @@ UNIFEX_TERM init_audio_stream(UnifexEnv *env, State *state, int channels,
   audio_stream->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
   audio_stream->codecpar->codec_id = AV_CODEC_ID_AAC;
   audio_stream->codecpar->sample_rate = sample_rate;
+  audio_stream->codecpar->bit_rate = bitrate;
   audio_stream->codecpar->ch_layout = *channel_layout;
   audio_stream->codecpar->extradata_size = aac_config->size;
   audio_stream->codecpar->extradata =
@@ -130,11 +163,14 @@ UNIFEX_TERM init_audio_stream(UnifexEnv *env, State *state, int channels,
   }
   memcpy(audio_stream->codecpar->extradata, aac_config->data, aac_config->size);
 
-  bool ready = is_ready(state);
   if (ready && !state->header_written) {
-    if (avformat_write_header(state->output_ctx, NULL) < 0) {
+    AVDictionary *options = NULL;
+    av_dict_set(&options, "flvflags", "no_duration_filesize", 0);
+    if (avformat_write_header(state->output_ctx, &options) < 0) {
+      av_dict_free(&options);
       return unifex_raise(env, "Failed writing header");
     }
+    av_dict_free(&options);
     state->header_written = true;
   }
   return init_audio_stream_result_ok(env, ready, state);
@@ -143,33 +179,34 @@ UNIFEX_TERM init_audio_stream(UnifexEnv *env, State *state, int channels,
 UNIFEX_TERM write_video_frame(UnifexEnv *env, State *state,
                               UnifexPayload *frame, int64_t dts, int64_t pts,
                               int is_key_frame) {
+  if (!state->output_ctx) {
+    return write_video_frame_result_error_closed(env);
+  }
   if (state->video_stream_index == -1) {
-    return write_video_frame_result_error(
-        env,
-        "Video stream is not initialized. Stream format has not been received");
+    return write_video_frame_result_error_not_initialized(env);
+  }
+  if (!state->header_written) {
+    return write_video_frame_result_error_not_ready(env);
   }
 
   AVRational video_stream_time_base =
       state->output_ctx->streams[state->video_stream_index]->time_base;
   AVPacket *packet = av_packet_alloc();
-
-  uint8_t *data = (uint8_t *)av_malloc(frame->size);
-  memcpy(data, frame->data, frame->size);
-  av_packet_from_data(packet, data, frame->size);
-
   UNIFEX_TERM write_frame_result;
+
+  // av_new_packet adds the padding FFmpeg's bitstream filters may read
+  if (!packet || av_new_packet(packet, frame->size) < 0) {
+    write_frame_result =
+        unifex_raise(env, "Failed allocating video frame data");
+    goto end;
+  }
+  memcpy(packet->data, frame->data, frame->size);
 
   if (is_key_frame) {
     packet->flags |= AV_PKT_FLAG_KEY;
   }
 
   packet->stream_index = state->video_stream_index;
-
-  if (!packet->data) {
-    write_frame_result =
-        unifex_raise(env, "Failed allocating video frame data");
-    goto end;
-  }
 
   int64_t dts_scaled =
       av_rescale_q(dts, MEMBRANE_TIME_BASE, video_stream_time_base);
@@ -197,29 +234,30 @@ end:
 
 UNIFEX_TERM write_audio_frame(UnifexEnv *env, State *state,
                               UnifexPayload *frame, int64_t pts) {
+  if (!state->output_ctx) {
+    return write_audio_frame_result_error_closed(env);
+  }
   if (state->audio_stream_index == -1) {
-    return write_audio_frame_result_error(
-        env, "Audio stream has not been initialized. Stream format has not "
-             "been received");
+    return write_audio_frame_result_error_not_initialized(env);
+  }
+  if (!state->header_written) {
+    return write_audio_frame_result_error_not_ready(env);
   }
 
   AVRational audio_stream_time_base =
       state->output_ctx->streams[state->audio_stream_index]->time_base;
   AVPacket *packet = av_packet_alloc();
-
-  uint8_t *data = (uint8_t *)av_malloc(frame->size);
-  memcpy(data, frame->data, frame->size);
-  av_packet_from_data(packet, data, frame->size);
-
   UNIFEX_TERM write_frame_result;
 
-  packet->stream_index = state->audio_stream_index;
-
-  if (!packet->data) {
+  // av_new_packet adds the padding FFmpeg's bitstream filters may read
+  if (!packet || av_new_packet(packet, frame->size) < 0) {
     write_frame_result =
         unifex_raise(env, "Failed allocating audio frame data.");
     goto end;
   }
+  memcpy(packet->data, frame->data, frame->size);
+
+  packet->stream_index = state->audio_stream_index;
 
   int64_t pts_scaled =
       av_rescale_q(pts, MEMBRANE_TIME_BASE, audio_stream_time_base);
@@ -252,18 +290,14 @@ void handle_init_state(State *state) {
   state->current_audio_pts = 0;
 
   state->header_written = false;
-  state->closed = false;
 
   state->output_ctx = NULL;
 }
 
 void handle_destroy_state(UnifexEnv *env, State *state) {
   UNIFEX_UNUSED(env);
-  if (!state->closed)
-    flush_and_close_stream(env, state);
-}
-
-bool is_ready(State *state) {
-  return (!state->audio_present || state->audio_stream_index != -1) &&
-         (!state->video_present || state->video_stream_index != -1);
+  if (state->output_ctx && state->header_written) {
+    av_write_trailer(state->output_ctx);
+  }
+  close_output(state);
 }

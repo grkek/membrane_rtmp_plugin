@@ -19,6 +19,44 @@ defmodule Membrane.RTMP.Sink do
   @connection_attempt_interval 500
   @type track_type :: :audio | :video
 
+  defmodule State do
+    @moduledoc false
+
+    alias Membrane.{Buffer, Pad}
+
+    @enforce_keys [
+      :rtmp_url,
+      :max_attempts,
+      :tracks,
+      :reset_timestamps,
+      :video_bitrate,
+      :audio_bitrate,
+      :frame_buffer,
+      :forward_mode?
+    ]
+    defstruct @enforce_keys ++ [attempts: 0, native: nil, ready?: false, video_base_dts: nil]
+
+    @type t :: %__MODULE__{
+            rtmp_url: String.t(),
+            max_attempts: pos_integer() | :infinity,
+            tracks: [Membrane.RTMP.Sink.track_type()],
+            reset_timestamps: boolean(),
+            video_bitrate: non_neg_integer(),
+            audio_bitrate: non_neg_integer(),
+            attempts: non_neg_integer(),
+            native: reference() | nil,
+            # Keys here are the pad names.
+            frame_buffer: %{Pad.ref() => Buffer.t() | nil},
+            ready?: boolean(),
+            # Activated when one of the source inputs gets closed. Interleaving is
+            # disabled, frame buffer is flushed and from that point buffers on the
+            # remaining pad are simply forwarded to the output.
+            # Always on if a single track is connected
+            forward_mode?: boolean(),
+            video_base_dts: Membrane.Time.t() | nil
+          }
+  end
+
   def_input_pad :audio,
     availability: :on_request,
     accepted_format: AAC,
@@ -60,6 +98,22 @@ defmodule Membrane.RTMP.Sink do
                 If enabled, this feature adjusts the timing of outgoing FLV packets so that they begin from zero.
                 Leaves it untouched otherwise.
                 """
+              ],
+              video_bitrate: [
+                spec: non_neg_integer(),
+                default: 0,
+                description: """
+                Video bitrate in bits per second, advertised as `videodatarate` in the FLV metadata.
+                `0` leaves it undeclared.
+                """
+              ],
+              audio_bitrate: [
+                spec: non_neg_integer(),
+                default: 0,
+                description: """
+                Audio bitrate in bits per second, advertised as `audiodatarate` in the FLV metadata.
+                `0` leaves it undeclared.
+                """
               ]
 
   @impl true
@@ -75,31 +129,23 @@ defmodule Membrane.RTMP.Sink do
 
     options = %{options | tracks: Enum.uniq(options.tracks)}
 
-    unless length(options.tracks) > 0 and
-             Enum.all?(options.tracks, &Kernel.in(&1, [:audio, :video])) do
+    if Enum.any?(options.tracks, &(&1 not in [:audio, :video])) do
       raise ArgumentError, "All track have to be either :audio or :video"
     end
 
     single_track? = length(options.tracks) == 1
     frame_buffer = Enum.map(options.tracks, &{Pad.ref(&1, 0), nil}) |> Enum.into(%{})
 
-    state =
-      options
-      |> Map.from_struct()
-      |> Map.merge(%{
-        attempts: 0,
-        native: nil,
-        # Keys here are the pad names.
-        frame_buffer: frame_buffer,
-        ready?: false,
-        # Activated when one of the source inputs gets closed. Interleaving is
-        # disabled, frame buffer is flushed and from that point buffers on the
-        # remaining pad are simply forwarded to the output.
-        # Always on if a single track is connected
-        forward_mode?: single_track?,
-        video_base_dts: nil,
-        reset_timestampts: options.reset_timestamps
-      })
+    state = %State{
+      rtmp_url: options.rtmp_url,
+      max_attempts: options.max_attempts,
+      tracks: options.tracks,
+      reset_timestamps: options.reset_timestamps,
+      video_bitrate: options.video_bitrate,
+      audio_bitrate: options.audio_bitrate,
+      frame_buffer: frame_buffer,
+      forward_mode?: single_track?
+    }
 
     {[], state}
   end
@@ -111,10 +157,8 @@ defmodule Membrane.RTMP.Sink do
 
     {:ok, native} = Native.create(state.rtmp_url, audio?, video?)
 
-    state
-    |> Map.put(:native, native)
-    |> try_connect()
-    |> then(&{[], &1})
+    state = try_connect(%{state | native: native})
+    {[], state}
   end
 
   @impl true
@@ -138,7 +182,7 @@ defmodule Membrane.RTMP.Sink do
         _ctx,
         state
       ) do
-    case Native.init_video_stream(state.native, width, height, dcr) do
+    case Native.init_video_stream(state.native, width, height, state.video_bitrate, dcr) do
       {:ok, ready?, native} ->
         Membrane.Logger.debug("Correctly initialized video stream.")
         {[], %{state | native: native, ready?: ready?}}
@@ -149,6 +193,9 @@ defmodule Membrane.RTMP.Sink do
         )
 
         {[], state}
+
+      {:error, reason} ->
+        raise "initializing video stream failed with reason: #{inspect(reason)}"
     end
   end
 
@@ -166,6 +213,7 @@ defmodule Membrane.RTMP.Sink do
            state.native,
            stream_format.channels,
            stream_format.sample_rate,
+           state.audio_bitrate,
            aac_config
          ) do
       {:ok, ready?, native} ->
@@ -178,6 +226,9 @@ defmodule Membrane.RTMP.Sink do
         )
 
         {[], state}
+
+      {:error, reason} ->
+        raise "initializing audio stream failed with reason: #{inspect(reason)}"
     end
   end
 
@@ -198,21 +249,33 @@ defmodule Membrane.RTMP.Sink do
 
   @impl true
   def handle_end_of_stream(Pad.ref(type, 0), _ctx, state) do
-    if state.forward_mode? do
-      Native.finalize_stream(state.native)
-      {[], state}
-    else
-      # The interleave logic does not work if either one of the inputs does not
-      # produce buffers. From this point on we act as a "forward" filter.
-      other_pad =
-        case type do
-          :audio -> :video
-          :video -> :audio
-        end
-        |> then(&Pad.ref(&1, 0))
+    cond do
+      state.forward_mode? ->
+        case Native.finalize_stream(state.native) do
+          :ok ->
+            :ok
 
-      state = flush_frame_buffer(state)
-      {[demand: other_pad], %{state | forward_mode?: true}}
+          {:error, reason} ->
+            Membrane.Logger.warning("Finalizing stream failed: #{inspect(reason)}")
+        end
+
+        {[], state}
+
+      state.ready? ->
+        # The interleave logic does not work if either one of the inputs does not
+        # produce buffers. From this point on we act as a "forward" filter.
+        other_pad =
+          case type do
+            :audio -> :video
+            :video -> :audio
+          end
+          |> then(&Pad.ref(&1, 0))
+
+        state = flush_frame_buffer(state)
+        {[demand: other_pad], %{state | forward_mode?: true}}
+
+      true ->
+        {[], state}
     end
   end
 
@@ -251,8 +314,8 @@ defmodule Membrane.RTMP.Sink do
   end
 
   defp fill_frame_buffer(state, pad, buffer) do
-    if get_in(state, [:frame_buffer, pad]) == nil do
-      put_in(state, [:frame_buffer, pad], buffer)
+    if state.frame_buffer[pad] == nil do
+      put_frame(state, pad, buffer)
     else
       raise "attempted to overwrite frame buffer on pad #{inspect(pad)}"
     end
@@ -279,7 +342,7 @@ defmodule Membrane.RTMP.Sink do
     state =
       state
       |> write_frame(pad, buffer)
-      |> put_in([:frame_buffer, pad], nil)
+      |> put_frame(pad, nil)
 
     {build_demand(state), state}
   end
@@ -288,15 +351,19 @@ defmodule Membrane.RTMP.Sink do
     pads_with_buffer =
       frame_buffer
       |> Enum.filter(fn {_pad, buffer} -> buffer != nil end)
-      |> Enum.sort(fn {_, left}, {_, right} ->
+      |> Enum.sort(fn {_left_pad, left}, {_right_pad, right} ->
         Buffer.get_dts_or_pts(left) <= Buffer.get_dts_or_pts(right)
       end)
 
     Enum.reduce(pads_with_buffer, state, fn {pad, buffer}, state ->
       state
       |> write_frame(pad, buffer)
-      |> put_in([:frame_buffer, pad], nil)
+      |> put_frame(pad, nil)
     end)
+  end
+
+  defp put_frame(state, pad, buffer) do
+    %{state | frame_buffer: Map.put(state.frame_buffer, pad, buffer)}
   end
 
   defp write_frame(state, Pad.ref(:audio, 0), buffer) do
@@ -304,7 +371,7 @@ defmodule Membrane.RTMP.Sink do
 
     case Native.write_audio_frame(state.native, buffer.payload, buffer_pts) do
       {:ok, native} ->
-        Map.put(state, :native, native)
+        %{state | native: native}
 
       {:error, reason} ->
         raise "writing audio frame failed with reason: #{inspect(reason)}"
@@ -322,7 +389,7 @@ defmodule Membrane.RTMP.Sink do
            buffer.metadata.h264.key_frame?
          ) do
       {:ok, native} ->
-        Map.put(state, :native, native)
+        %{state | native: native}
 
       {:error, reason} ->
         raise "writing video frame failed with reason: #{inspect(reason)}"
@@ -340,7 +407,7 @@ defmodule Membrane.RTMP.Sink do
   end
 
   defp correct_timings(dts, pts, state) do
-    {base_dts, state} = Bunch.Map.get_updated!(state, :video_base_dts, &(&1 || dts))
-    {{dts - base_dts, pts - base_dts}, state}
+    base_dts = state.video_base_dts || dts
+    {{dts - base_dts, pts - base_dts}, %{state | video_base_dts: base_dts}}
   end
 end

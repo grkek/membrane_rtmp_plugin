@@ -6,27 +6,14 @@ defmodule Membrane.RTMP.Source.ClientHandlerImpl do
 
   @behaviour Membrane.RTMPServer.ClientHandler
 
-  defstruct [:controlling_process]
+  defstruct []
 
   @impl true
-  def handle_init(opts) do
+  def handle_init(_opts) do
     %{
       source_pid: nil,
-      buffered: [],
-      app: nil,
-      stream_key: nil,
-      controlling_process: opts.controlling_process
+      buffered: []
     }
-  end
-
-  @impl true
-  def handle_connected(connected_msg, state) do
-    %{state | app: connected_msg.app}
-  end
-
-  @impl true
-  def handle_stream_published(publish_msg, state) do
-    %{state | stream_key: publish_msg.stream_key}
   end
 
   @impl true
@@ -53,18 +40,19 @@ defmodule Membrane.RTMP.Source.ClientHandlerImpl do
   end
 
   @impl true
-  def handle_end_of_stream(state) do
-    if state.source_pid != nil, do: send_eos(state.source_pid)
+  def handle_connection_closed(state) do
+    if state.source_pid != nil, do: send(state.source_pid, :connection_closed)
+    state
+  end
+
+  @impl true
+  def handle_delete_stream(state) do
+    if state.source_pid != nil, do: send(state.source_pid, :delete_stream)
     state
   end
 
   defp send_data(pid, payload) do
     send(pid, {:data, payload})
-    :ok
-  end
-
-  defp send_eos(pid) do
-    send(pid, :end_of_stream)
     :ok
   end
 end
